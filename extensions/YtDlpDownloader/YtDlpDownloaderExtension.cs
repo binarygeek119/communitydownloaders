@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
@@ -34,6 +35,8 @@ public sealed class YtDlpDownloaderExtension : IDownloaderProvider
         DownloaderCapabilities.ResumeSupported);
 
     private static readonly SiteSessionCoordinator SiteSessions = new();
+
+    private static readonly MediaInfoCache MediaInfos = new();
 
     private IYtDlpCommandRunner? _runner;
     private IServiceProvider? _services;
@@ -127,6 +130,9 @@ public sealed class YtDlpDownloaderExtension : IDownloaderProvider
     public interface IYtDlpCommandRunner
     {
         Task<YtDlpCommandResult> RunAsync(IEnumerable<string> arguments, CancellationToken ct);
+
+        /// <summary>Runs yt-dlp with <paramref name="standardInput"/> written to its standard input.</summary>
+        Task<YtDlpCommandResult> RunAsync(IEnumerable<string> arguments, string standardInput, CancellationToken ct);
     }
 
     public sealed record YtDlpCommandResult(int ExitCode, string StandardOutput, string StandardError);
@@ -207,6 +213,7 @@ public sealed class YtDlpDownloaderExtension : IDownloaderProvider
 
         host.ReportProgress(0.15d, $"Downloading {info.Title}...");
         var outputTemplate = Path.Combine(host.TempDirectory, "downloaded.%(ext)s");
+
         var command = await RunForUrlAsync(
             info.NormalizedUrl,
             [
@@ -217,10 +224,15 @@ public sealed class YtDlpDownloaderExtension : IDownloaderProvider
                 "--output",
                 outputTemplate,
                 "--format",
-                expectedEntity == DownloaderEntity.Video ? BuildVideoFormatSelector(request.QualityId) : "bestaudio/best",
-                info.NormalizedUrl,
+                expectedEntity == DownloaderEntity.Video ? BuildVideoFormatSelector(request.QualityId, request.MaxHeight) : "bestaudio/best",
+                // Download from the extraction already made, piped in, rather than from the URL, so yt-dlp
+                // fetches only the media instead of loading the page again. The extraction holds the site's
+                // session cookies, so it is never written to disk.
+                "--load-info-json",
+                "-",
             ],
-            ct);
+            ct,
+            standardInput: EscapeNonAscii(info.InfoJson));
 
         LogCommandResult(logger, request.Url, "download", command, includeStandardOutput: false);
 
@@ -267,7 +279,12 @@ public sealed class YtDlpDownloaderExtension : IDownloaderProvider
             || message.Contains("No suitable extractor", StringComparison.OrdinalIgnoreCase);
     }
 
-    private async Task<YtDlpMediaInfo> GetMediaInfoAsync(string url, CancellationToken ct)
+    private Task<YtDlpMediaInfo> GetMediaInfoAsync(string url, CancellationToken ct)
+    {
+        return MediaInfos.GetOrExtractAsync(url, ExtractMediaInfoAsync, ct);
+    }
+
+    private async Task<YtDlpMediaInfo> ExtractMediaInfoAsync(string url, CancellationToken ct)
     {
         var command = await RunForUrlAsync(
             url,
@@ -292,7 +309,9 @@ public sealed class YtDlpDownloaderExtension : IDownloaderProvider
                 hasVideo,
                 hasAudio,
                 ExtractAvailableResolutions(root),
-                BuildVideoMetadata(root, normalizedUrl.Trim(), title.Trim(), string.IsNullOrWhiteSpace(mediaId) ? null : mediaId.Trim()));
+                BuildVideoMetadata(root, normalizedUrl.Trim(), title.Trim(), string.IsNullOrWhiteSpace(mediaId) ? null : mediaId.Trim()),
+                command.StandardOutput,
+                DateTimeOffset.UtcNow);
         }
         catch (JsonException ex)
         {
@@ -369,11 +388,11 @@ public sealed class YtDlpDownloaderExtension : IDownloaderProvider
     /// which lets them overlap once a session is on file and stops them outright after a failed sign-in.
     /// URLs with no saved login run exactly as before.
     /// </summary>
-    private async Task<YtDlpCommandResult> RunForUrlAsync(string url, IReadOnlyList<string> commandArguments, CancellationToken ct)
+    private async Task<YtDlpCommandResult> RunForUrlAsync(string url, IReadOnlyList<string> commandArguments, CancellationToken ct, string? standardInput = null)
     {
         var settings = ReadSettings(url);
         if (string.IsNullOrWhiteSpace(settings.ThrottleSite) || string.IsNullOrWhiteSpace(settings.SiteCookieJar))
-            return await GetRunner().RunAsync([.. settings.BuildArguments(), .. commandArguments], ct);
+            return await RunAsync([.. settings.BuildArguments(), .. commandArguments]);
 
         using var run = await SiteSessions.BeginRunAsync(
             settings.ThrottleSite,
@@ -382,9 +401,7 @@ public sealed class YtDlpDownloaderExtension : IDownloaderProvider
             GetSiteRequestInterval(),
             ct);
 
-        var command = await GetRunner().RunAsync(
-            [.. (settings with { CookiesPath = run.CookieJar }).BuildArguments(), .. commandArguments],
-            ct);
+        var command = await RunAsync([.. (settings with { CookiesPath = run.CookieJar }).BuildArguments(), .. commandArguments]);
 
         if (command.ExitCode == 0)
             await run.KeepSessionAsync(ct);
@@ -392,6 +409,10 @@ public sealed class YtDlpDownloaderExtension : IDownloaderProvider
             await run.PauseAfterFailedSignInAsync(reason, ct);
 
         return command;
+
+        Task<YtDlpCommandResult> RunAsync(IReadOnlyList<string> arguments) => standardInput is null
+            ? GetRunner().RunAsync(arguments, ct)
+            : GetRunner().RunAsync(arguments, standardInput, ct);
     }
 
     private string? GetSetting(string key, params string[] environmentVariables)
@@ -552,10 +573,12 @@ public sealed class YtDlpDownloaderExtension : IDownloaderProvider
         return GetPositiveInt(format, "height") is not null;
     }
 
-    private static string BuildVideoFormatSelector(string? qualityId)
+    // A request for the best quality honors Cove's "Max download resolution" setting, which the host
+    // passes as MaxHeight. A request that names a resolution keeps it.
+    private static string BuildVideoFormatSelector(string? qualityId, int? maxHeight)
     {
         if (string.IsNullOrWhiteSpace(qualityId) || string.Equals(qualityId, "best", StringComparison.OrdinalIgnoreCase))
-            return "best";
+            return maxHeight is > 0 ? $"best[height<={maxHeight.Value}]/best" : "best";
 
         const string prefix = "max-height-";
         if (qualityId.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
@@ -565,7 +588,7 @@ public sealed class YtDlpDownloaderExtension : IDownloaderProvider
             return $"best[height<={height}]/best";
         }
 
-        return "best";
+        return maxHeight is > 0 ? $"best[height<={maxHeight.Value}]/best" : "best";
     }
 
     private static ScrapedVideoDto BuildVideoMetadata(JsonElement root, string normalizedUrl, string title, string? mediaId)
@@ -667,6 +690,24 @@ public sealed class YtDlpDownloaderExtension : IDownloaderProvider
         var trimmed = candidate.Trim();
         if (!values.Contains(trimmed, StringComparer.OrdinalIgnoreCase))
             values.Add(trimmed);
+    }
+
+    /// <summary>
+    /// Escapes every non-ASCII character in JSON text as \uXXXX, which leaves the document's meaning
+    /// unchanged, so yt-dlp reads it the same whatever encoding its standard input defaults to.
+    /// </summary>
+    private static string EscapeNonAscii(string json)
+    {
+        var builder = new System.Text.StringBuilder(json.Length);
+        foreach (var character in json)
+        {
+            if (character < 0x80)
+                builder.Append(character);
+            else
+                builder.Append("\\u").Append(((int)character).ToString("x4", CultureInfo.InvariantCulture));
+        }
+
+        return builder.ToString();
     }
 
     private static string? FindDownloadedFile(string directory)
@@ -1105,13 +1146,14 @@ public sealed class YtDlpDownloaderExtension : IDownloaderProvider
         };
     }
 
-    private static async Task<YtDlpCommandResult> RunProcessAsync(string executable, IEnumerable<string> arguments, CancellationToken ct)
+    private static async Task<YtDlpCommandResult> RunProcessAsync(string executable, IEnumerable<string> arguments, CancellationToken ct, string? standardInput = null)
     {
         using var process = new Process
         {
             StartInfo = new ProcessStartInfo
             {
                 FileName = executable,
+                RedirectStandardInput = standardInput is not null,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -1145,18 +1187,113 @@ public sealed class YtDlpDownloaderExtension : IDownloaderProvider
 
         var stdoutTask = process.StandardOutput.ReadToEndAsync();
         var stderrTask = process.StandardError.ReadToEndAsync();
+        if (standardInput is not null)
+        {
+            await process.StandardInput.WriteAsync(standardInput.AsMemory(), ct);
+            process.StandardInput.Close();
+        }
+
         await process.WaitForExitAsync(ct);
 
         return new YtDlpCommandResult(process.ExitCode, (await stdoutTask).Trim(), (await stderrTask).Trim());
     }
 
-    private sealed record YtDlpMediaInfo(string NormalizedUrl, string Title, string? MediaId, bool HasVideo, bool HasAudio, IReadOnlyList<VideoResolution> AvailableResolutions, ScrapedVideoDto VideoMetadata);
+    private sealed record YtDlpMediaInfo(
+        string NormalizedUrl,
+        string Title,
+        string? MediaId,
+        bool HasVideo,
+        bool HasAudio,
+        IReadOnlyList<VideoResolution> AvailableResolutions,
+        ScrapedVideoDto VideoMetadata,
+        string InfoJson,
+        DateTimeOffset ExtractedAt);
+
+    /// <summary>
+    /// Keeps each URL's yt-dlp extraction for a few minutes. Every extraction loads the page (and, for a
+    /// site with a saved login, may sign in), and sites throttle or block accounts that do that too often.
+    /// Cove matches a URL moments before it downloads it, so without this every item reached the site
+    /// twice before its media was fetched, three times counting the download's own page load.
+    /// Concurrent requests for one URL share a single extraction.
+    /// </summary>
+    private sealed class MediaInfoCache
+    {
+        // Short enough that the media addresses inside an extraction, which sites sign with an expiry,
+        // are still valid when the download uses them.
+        private static readonly TimeSpan Lifetime = TimeSpan.FromMinutes(15);
+        private const int Capacity = 500;
+
+        private readonly ConcurrentDictionary<string, Lazy<Task<YtDlpMediaInfo>>> _entries = new(StringComparer.Ordinal);
+
+        public async Task<YtDlpMediaInfo> GetOrExtractAsync(string url, Func<string, CancellationToken, Task<YtDlpMediaInfo>> extract, CancellationToken ct)
+        {
+            var key = url.Trim();
+            while (true)
+            {
+                var entry = _entries.GetOrAdd(key, _ => new Lazy<Task<YtDlpMediaInfo>>(() => extract(key, ct)));
+                YtDlpMediaInfo info;
+                try
+                {
+                    info = await entry.Value.WaitAsync(ct);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    // Another request started this extraction and was cancelled; extract again for this one.
+                    _entries.TryRemove(new KeyValuePair<string, Lazy<Task<YtDlpMediaInfo>>>(key, entry));
+                    continue;
+                }
+                catch (Exception) when (entry.IsValueCreated && entry.Value.IsFaulted)
+                {
+                    _entries.TryRemove(new KeyValuePair<string, Lazy<Task<YtDlpMediaInfo>>>(key, entry));
+                    throw;
+                }
+
+                if (info.ExtractedAt + Lifetime <= DateTimeOffset.UtcNow)
+                {
+                    _entries.TryRemove(new KeyValuePair<string, Lazy<Task<YtDlpMediaInfo>>>(key, entry));
+                    continue;
+                }
+
+                // Cove downloads the address the match reported, so file the extraction under it as well.
+                if (!string.Equals(info.NormalizedUrl, key, StringComparison.Ordinal))
+                    _entries.TryAdd(info.NormalizedUrl, entry);
+
+                Prune();
+                return info;
+            }
+        }
+
+        private void Prune()
+        {
+            if (_entries.Count <= Capacity)
+                return;
+
+            var now = DateTimeOffset.UtcNow;
+            var finished = _entries
+                .Where(pair => pair.Value.IsValueCreated && pair.Value.Value.IsCompletedSuccessfully)
+                .OrderBy(pair => pair.Value.Value.Result.ExtractedAt)
+                .ToList();
+            foreach (var pair in finished)
+            {
+                if (_entries.Count <= Capacity && pair.Value.Value.Result.ExtractedAt + Lifetime > now)
+                    break;
+
+                _entries.TryRemove(pair);
+            }
+        }
+    }
 
     private sealed record VideoResolution(int Height, int? Width);
 
     private sealed class ProcessYtDlpCommandRunner(YtDlpExecutableResolver executableResolver, ILogger logger) : IYtDlpCommandRunner
     {
-        public async Task<YtDlpCommandResult> RunAsync(IEnumerable<string> arguments, CancellationToken ct)
+        public Task<YtDlpCommandResult> RunAsync(IEnumerable<string> arguments, CancellationToken ct)
+            => RunCoreAsync(arguments, null, ct);
+
+        public Task<YtDlpCommandResult> RunAsync(IEnumerable<string> arguments, string standardInput, CancellationToken ct)
+            => RunCoreAsync(arguments, standardInput, ct);
+
+        private async Task<YtDlpCommandResult> RunCoreAsync(IEnumerable<string> arguments, string? standardInput, CancellationToken ct)
         {
             var argumentList = arguments.ToList();
             var executable = await executableResolver.ResolveAsync(ct);
@@ -1169,7 +1306,7 @@ public sealed class YtDlpDownloaderExtension : IDownloaderProvider
                     FormatYtDlpArguments(argumentList));
             }
 
-            var result = await RunProcessAsync(executable, argumentList, ct);
+            var result = await RunProcessAsync(executable, argumentList, ct, standardInput);
             if (isVersionProbe)
             {
                 logger.LogDebug("Resolved yt-dlp executable {Executable}. Version: {Version}", executable, result.StandardOutput);
