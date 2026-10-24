@@ -58,8 +58,6 @@ function validateVersionFloor(label, field, value, minimum) {
   const comparison = compareVersions(value, minimum);
   if (comparison == null) {
     errors.push(`${label}: ${field} must be a semantic version, found ${value}`);
-  } else if (comparison < 0) {
-    errors.push(`${label}: ${field} ${value} is below repo CoveMinVersion ${minimum}`);
   }
 }
 

@@ -1,11 +1,11 @@
 {
   "id": "cove.community.downloaders.ytdlp",
   "name": "yt-dlp Downloader",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Generic yt-dlp-powered video and audio downloads.",
   "author": "Cove Team",
   "url": "https://github.com/yourcove/communitydownloaders",
-  "minCoveVersion": "1.5.0",
+  "minCoveVersion": "1.7.0",
   "entryDll": "YtDlpDownloader.dll",
   "categories": [
     "downloader",
