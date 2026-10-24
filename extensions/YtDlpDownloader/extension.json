@@ -5,7 +5,7 @@
   "description": "Generic yt-dlp-powered video and audio downloads.",
   "author": "Cove Team",
   "url": "https://github.com/yourcove/communitydownloaders",
-  "minCoveVersion": "1.5.0",
+  "minCoveVersion": "1.7.0",
   "entryDll": "YtDlpDownloader.dll",
   "categories": [
     "downloader",
