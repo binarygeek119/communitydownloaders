@@ -31,6 +31,12 @@
       "id": "cove.community.downloaders.ytdlp",
       "path": "extensions/YtDlpDownloader",
       "tagPrefix": "ytdlp/"
+    },
+    {
+      "name": "CommonImageDownloader",
+      "id": "cove.community.downloaders.common-image",
+      "path": "extensions/CommonImageDownloader",
+      "tagPrefix": "common-image/"
     }
   ]
 }

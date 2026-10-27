@@ -13,6 +13,7 @@
   ],
   "dependencies": {
     "cove.community.downloaders.common-audio": ">=1.0.0",
+    "cove.community.downloaders.common-image": ">=1.0.0",
     "cove.community.downloaders.common-text": ">=1.0.0",
     "cove.community.downloaders.reddit": ">=1.0.0",
     "cove.community.downloaders.ytdlp": ">=1.0.0"

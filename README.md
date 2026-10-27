@@ -6,6 +6,7 @@ Community-maintained downloader extensions published through the official Cove e
 
 - `cove.community.downloaders` - manifest-only bundle that installs the common downloader set.
 - `cove.community.downloaders.common-audio` - Soundgasm and Whyp audio downloads.
+- `cove.community.downloaders.common-image` - Image downloads from common booru/image pages, with scraped metadata.
 - `cove.community.downloaders.common-text` - Literotica text downloads.
 - `cove.community.downloaders.reddit` - Reddit-hosted media downloads and downloader delegation for linked posts.
 - `cove.community.downloaders.ytdlp` - generic video/audio downloads through `yt-dlp`.
